@@ -1,0 +1,13 @@
+# --- add this snippet to your existing docker-compose.yml file ---
+# --- this will define a small container that will serve the maintenance page you define in /maintenance/index.html---
+# --- this assumes you have a docker network by the name nginxproxymanager ---
+  
+  # --- Maintenance page container ---
+  maintenance:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./maintenance:/usr/share/nginx/html:ro
+    networks:
+      - nginxproxymanager
+  # ----------------------------------
