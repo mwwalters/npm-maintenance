@@ -1,0 +1,54 @@
+services:
+  app:
+    build: .
+    image: jc21/nginx-proxy-manager:custom
+    restart: unless-stopped
+    ports:
+      - '80:80'  # Public HTTP Port
+      - '443:443'  # Public HTTPS Port
+      - '81:81'  # Admin Web Port
+    environment:
+      DB_MYSQL_HOST: 'db'
+      DB_MYSQL_PORT: '3306'
+      DB_MYSQL_USER: 'npm'
+      DB_MYSQL_PASSWORD: 'your_secure_password'  # Replace with your secure password
+      DB_MYSQL_NAME: 'npm'
+      TZ: 'your_timezone_here'  # Set the timezone
+      # Uncomment this if IPv6 is not enabled on your host
+      # DISABLE_IPV6: 'true'
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+      - /root/nginx-proxy-manager/logs:/data/logs  # Bind host logs directory
+    depends_on:
+      - db
+    networks:
+      - nginxproxymanager
+
+  db:
+    image: 'jc21/mariadb-aria:latest'
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: 'your_secure_root_password'  # Replace with your secure root password
+      MYSQL_DATABASE: 'npm'
+      MYSQL_USER: 'npm'
+      MYSQL_PASSWORD: 'your_secure_password'  # Replace with your secure password
+      MARIADB_AUTO_UPGRADE: '1'
+    volumes:
+      - ./mysql:/var/lib/mysql
+    networks:
+      - nginxproxymanager
+
+  # --- Maintenance page container ---
+  maintenance:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./maintenance:/usr/share/nginx/html:ro
+    networks:
+      - nginxproxymanager
+  # ----------------------------------
+
+networks:
+  nginxproxymanager:
+    external: true
