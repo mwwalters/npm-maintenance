@@ -7,9 +7,6 @@ set -euo pipefail
 # ============================================================
 # Configuration
 # ============================================================
-NPM_URL="http://localhost:81"
-NPM_USER="username"
-NPM_PASS="password"
 
 MAINTENANCE_HOST="maintenance"
 MAINTENANCE_PORT=80
@@ -22,6 +19,26 @@ LOG_OUT="${LOG_DIR}/npm-maintenance.out"
 LOG_ERR="${LOG_DIR}/npm-maintenance.err"
 
 TRIGGERED_BY="$(whoami)"
+
+# ── Secrets ────────────────────────────────────────────────
+# Set your credentials in the .secrets file, an example file is provided with this project
+SECRETS_FILE="$(SCRIPT_DIR)/.secrets"
+
+if [ ! -f "$SECRETS_FILE" ]; then
+    echo "[ERROR] Secrets file not found: $SECRETS_FILE" >&2
+    echo "        Create it with NPM_USER, NPM_PASS, and NPM_URL defined." >&2
+    exit 1
+fi
+
+# Verify no other user can read it
+_perms="$(stat -c '%a' "$SECRETS_FILE")"
+if [ "$_perms" != "600" ] && [ "$_perms" != "400" ]; then
+    echo "[ERROR] Secrets file has unsafe permissions ($_perms). Run: chmod 600 $SECRETS_FILE" >&2
+    exit 1
+fi
+
+# shellcheck source=.secrets
+. "$SECRETS_FILE"
 
 # ============================================================
 # Logging
@@ -107,6 +124,25 @@ update_proxy_host() {
 }
 
 # ============================================================
+# Individual-host helpers
+# ============================================================
+
+# Returns the path to a per-host backup file for the select flow.
+# Separate namespace from proxy_backup.json used by the bulk flow.
+get_individual_backup_file() {
+    local domain="$1"
+    local safe
+    safe=$(printf '%s' "$domain" | tr -cd '[:alnum:].-' | tr '[:upper:]' '[:lower:]')
+    printf '%s/proxy_backup_single_%s.json' "$SCRIPT_DIR" "$safe"
+}
+
+# Prints a fixed-width ASCII separator (56 chars) — no tput required.
+print_separator() {
+    printf '%56s\n' '' | tr ' ' '='
+}
+
+
+# ============================================================
 # Enable maintenance
 # ============================================================
 enable_maintenance() {
@@ -159,6 +195,51 @@ enable_maintenance() {
 }
 
 # ============================================================
+# Enable maintenance — single host (select flow)
+# ============================================================
+enable_single_host() {
+    local id="$1"
+    local domain="$2"
+    local host_json="$3"
+    local backup_file
+    backup_file=$(get_individual_backup_file "$domain")
+
+    if [ -f "$backup_file" ]; then
+        log_error "Backup already exists for $domain — is it already in maintenance?"
+        log_error "  Backup: $backup_file"
+        return 1
+    fi
+
+    printf '%s\n' "$host_json" > "$backup_file"
+
+    local token body tmp http_code response
+    token=$(get_token)
+    body=$(printf '%s' "$host_json" | jq -c \
+        "del(.id, .created_on, .modified_on, .owner_user_id)
+         | .forward_host   = \"${MAINTENANCE_HOST}\"
+         | .forward_port   = ${MAINTENANCE_PORT}
+         | .forward_scheme = \"${MAINTENANCE_SCHEME}\"")
+
+    tmp=$(mktemp)
+    http_code=$(curl -s -o "$tmp" -w "%{http_code}" \
+        -X PUT \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "${NPM_URL}/api/nginx/proxy-hosts/${id}")
+    response=$(cat "$tmp"); rm -f "$tmp"
+
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        log_info "✓ $domain (id: $id) → maintenance:${MAINTENANCE_PORT}"
+        log_info "  Backup: $backup_file"
+    else
+        rm -f "$backup_file"
+        log_error "✗ $domain (id: $id) — API error: $(printf '%s' "$response" | jq -r '.error.message // .message // "unknown"')"
+        return 1
+    fi
+}
+
+# ============================================================
 # Disable maintenance
 # ============================================================
 disable_maintenance() {
@@ -203,7 +284,7 @@ disable_maintenance() {
       log_info "  ✓ [$((i+1))/$count] $domain (id: $id) → ${fwd_host}:${fwd_port}"
       success=$((success + 1))
     else
-      log_error "  ✗ [$((i+1))/$total] $domain (id: $id) — API error: $(echo "$response" | jq -r '.error.message // .message // "unknown"')"
+      log_error "  ✗ [$((i+1))/$count] $domain (id: $id) — API error: $(echo "$response" | jq -r '.error.message // .message // "unknown"')"
     fi
   done
 
@@ -219,19 +300,258 @@ disable_maintenance() {
 }
 
 # ============================================================
+# Disable maintenance — single host  (select flow)
+# ============================================================
+disable_single_host() {
+    local id="$1"
+    local domain="$2"
+    local backup_file
+    backup_file=$(get_individual_backup_file "$domain")
+
+    if [ ! -f "$backup_file" ]; then
+        log_error "No individual backup found for $domain"
+        log_error "  Expected: $backup_file"
+        log_error "  If this host was put into maintenance via 'enable' (bulk), use 'disable' instead."
+        return 1
+    fi
+
+    local backup_json fwd_host fwd_port fwd_scheme body token tmp http_code response
+    backup_json=$(cat "$backup_file")
+    fwd_host=$(  printf '%s' "$backup_json" | jq -r '.forward_host')
+    fwd_port=$(  printf '%s' "$backup_json" | jq -r '.forward_port')
+    fwd_scheme=$(printf '%s' "$backup_json" | jq -r '.forward_scheme')
+
+    token=$(get_token)
+    body=$(printf '%s' "$backup_json" | jq -c \
+        "del(.id, .created_on, .modified_on, .owner_user_id)
+         | .forward_host   = \"${fwd_host}\"
+         | .forward_port   = ${fwd_port}
+         | .forward_scheme = \"${fwd_scheme}\"")
+
+    tmp=$(mktemp)
+    http_code=$(curl -s -o "$tmp" -w "%{http_code}" \
+        -X PUT \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "${NPM_URL}/api/nginx/proxy-hosts/${id}")
+    response=$(cat "$tmp"); rm -f "$tmp"
+
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        rm -f "$backup_file"
+        log_info "✓ $domain (id: $id) → ${fwd_host}:${fwd_port} (restored, backup cleared)"
+    else
+        log_error "✗ $domain (id: $id) — HTTP $http_code: $(printf '%s' "$response" | jq -r '.error.message // .message // "unknown"')"
+        return 1
+    fi
+}
+
+# ============================================================
+# Interactive select mode
+# ============================================================
+cmd_select() {
+    local page_size=10
+    local page=1
+    local token hosts total total_pages
+
+    token=$(get_token)
+    hosts=$(get_proxy_hosts "$token")
+    total=$(printf '%s' "$hosts" | jq 'length')
+
+    if [ "$total" -eq 0 ]; then
+        log_error "No proxy hosts returned from the NPM API."
+        log_separator
+        exit 1
+    fi
+
+    total_pages=$(( (total + page_size - 1) / page_size ))
+
+    while true; do
+        local slice_start slice_end slice_count
+        slice_start=$(( (page - 1) * page_size ))
+        slice_end=$(( slice_start + page_size - 1 ))
+        [ "$slice_end" -ge "$total" ] && slice_end=$(( total - 1 ))
+        slice_count=$(( slice_end - slice_start + 1 ))
+
+        clear 2>/dev/null || true
+        print_separator
+        printf '  NPM Maintenance Manager — Select a Proxy Host\n'
+        printf '  Page %d of %d  (%d total hosts)\n' "$page" "$total_pages" "$total"
+        print_separator
+        printf '\n'
+
+        local i=0
+        while [ "$i" -lt "$slice_count" ]; do
+            local abs_idx domain fwd_host state backup_file_check
+            abs_idx=$(( slice_start + i ))
+            domain=$(   printf '%s' "$hosts" | jq -r ".[$abs_idx].domain_names[0]")
+            fwd_host=$( printf '%s' "$hosts" | jq -r ".[$abs_idx].forward_host")
+            backup_file_check=$(get_individual_backup_file "$domain")
+
+            if [ "$fwd_host" = "$MAINTENANCE_HOST" ] || [ -f "$backup_file_check" ]; then
+                state="[MAINT]"
+            else
+                state="[ LIVE]"
+            fi
+
+            printf '  [%2d]  %-42s %s\n' "$(( i + 1 ))" "$domain" "$state"
+            i=$(( i + 1 ))
+        done
+
+        printf '\n'
+        print_separator
+
+        local nav_hint=""
+        [ "$total_pages" -gt 1 ] && nav_hint="[n]ext  [p]rev  "
+        printf '  %s[q]uit\n' "$nav_hint"
+        print_separator
+        printf '\n'
+        printf 'Select a number or action: '
+
+        local choice
+        read -r choice
+
+        case "$choice" in
+            q|Q)
+                log_info "Select mode exited by user."
+                log_separator
+                break
+                ;;
+            n|N)
+                if [ "$page" -lt "$total_pages" ]; then
+                    page=$(( page + 1 ))
+                else
+                    printf 'Already on the last page. Press Enter to continue.\n'
+                    read -r _dummy
+                fi
+                continue
+                ;;
+            p|P)
+                if [ "$page" -gt 1 ]; then
+                    page=$(( page - 1 ))
+                else
+                    printf 'Already on the first page. Press Enter to continue.\n'
+                    read -r _dummy
+                fi
+                continue
+                ;;
+            *)
+                # Must be a non-empty all-digit string
+                case "$choice" in
+                    ''|*[!0-9]*)
+                        printf 'Invalid input. Press Enter to try again.\n'
+                        read -r _dummy
+                        continue
+                        ;;
+                esac
+
+                # Range check against current page slice
+                if [ "$choice" -lt 1 ] || [ "$choice" -gt "$slice_count" ]; then
+                    printf 'Number out of range for this page. Press Enter to try again.\n'
+                    read -r _dummy
+                    continue
+                fi
+
+                local selected_idx selected_domain selected_id selected_json selected_fwd_host current_state selected_backup
+                selected_idx=$(    printf '%s' "$hosts" | jq -r "$(( slice_start + choice - 1 ))" 2>/dev/null || true)
+                selected_idx=$(( slice_start + choice - 1 ))
+                selected_domain=$( printf '%s' "$hosts" | jq -r ".[$selected_idx].domain_names[0]")
+                selected_id=$(     printf '%s' "$hosts" | jq -r ".[$selected_idx].id")
+                selected_json=$(   printf '%s' "$hosts" | jq -c ".[$selected_idx]")
+                selected_fwd_host=$(printf '%s' "$hosts" | jq -r ".[$selected_idx].forward_host")
+                selected_backup=$(get_individual_backup_file "$selected_domain")
+
+                if [ "$selected_fwd_host" = "$MAINTENANCE_HOST" ] || [ -f "$selected_backup" ]; then
+                    current_state="MAINTENANCE"
+                else
+                    current_state="LIVE"
+                fi
+
+                clear 2>/dev/null || true
+                print_separator
+                printf '  Host:   %s\n' "$selected_domain"
+                printf '  ID:     %s\n' "$selected_id"
+                printf '  Status: %s\n' "$current_state"
+                print_separator
+                printf '\n'
+
+                if [ "$current_state" = "LIVE" ]; then
+                    printf '  [1] Enable maintenance for this host\n'
+                    printf '  [2] Cancel — return to list\n'
+                    printf '\n'
+                    printf 'Choice: '
+                    local action
+                    read -r action
+                    case "$action" in
+                        1)
+                            printf '\n'
+                            log_info "Enabling maintenance for $selected_domain (id: $selected_id)"
+                            if enable_single_host "$selected_id" "$selected_domain" "$selected_json"; then
+                                printf '\nDone. Press Enter to return to the list.\n'
+                            else
+                                printf '\nFailed — check the log for details. Press Enter to continue.\n'
+                            fi
+                            read -r _dummy
+                            # Refresh host list so status reflects the change
+                            hosts=$(get_proxy_hosts "$(get_token)")
+                            ;;
+                        *)
+                            continue
+                            ;;
+                    esac
+
+                else
+                    printf '  [1] Disable maintenance for this host (restore from backup)\n'
+                    printf '  [2] Cancel — return to list\n'
+                    printf '\n'
+                    printf 'Choice: '
+                    local action
+                    read -r action
+                    case "$action" in
+                        1)
+                            printf '\n'
+                            log_info "Disabling maintenance for $selected_domain (id: $selected_id)"
+                            if disable_single_host "$selected_id" "$selected_domain"; then
+                                printf '\nDone. Press Enter to return to the list.\n'
+                            else
+                                printf '\nFailed — check the log for details. Press Enter to continue.\n'
+                            fi
+                            read -r _dummy
+                            # Refresh host list so status reflects the change
+                            hosts=$(get_proxy_hosts "$(get_token)")
+                            ;;
+                        *)
+                            continue
+                            ;;
+                    esac
+                fi
+                ;;
+        esac
+    done
+}
+
+
+# ============================================================
 # Entry point
 # ============================================================
-case "$1" in
-  enable)
-    preflight_checks
-    enable_maintenance
-    ;;
-  disable)
-    preflight_checks
-    disable_maintenance
-    ;;
-  *)
-    log_error "Invalid or missing argument. Usage: npm-maintenance {enable|disable}"
-    exit 1
-    ;;
+preflight_checks
+log_separator
+log_info "npm-maintenance called with arg: '${1:-}' (triggered by ${TRIGGERED_BY})"
+log_separator
+
+case "${1:-}" in
+    enable)
+        enable_maintenance
+        ;;
+    disable)
+        disable_maintenance
+        ;;
+    select)
+        cmd_select
+        ;;
+    *)
+        log_error "Invalid or missing argument. Usage: npm-maintenance {enable|disable|select}"
+        printf 'Usage: npm-maintenance {enable|disable|select}\n' >&2
+        exit 1
+        ;;
 esac

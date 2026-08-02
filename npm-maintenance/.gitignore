@@ -1,0 +1,10 @@
+# Secrets — never commit credentials
+npm-maintenance/.secrets
+
+# Runtime backups — contain live proxy config, not for version control
+npm-maintenance/proxy_backup.json
+npm-maintenance/proxy_backup_single_*.json
+
+# Logs
+npm-maintenance/npm-maintenance.out
+npm-maintenance/npm-maintenance.err
