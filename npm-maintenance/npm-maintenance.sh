@@ -22,7 +22,7 @@ TRIGGERED_BY="$(whoami)"
 
 # ── Secrets ────────────────────────────────────────────────
 # Set your credentials in the .secrets file, an example file is provided with this project
-SECRETS_FILE="$(SCRIPT_DIR)/.secrets"
+SECRETS_FILE="${SCRIPT_DIR}/.secrets"
 
 if [ ! -f "$SECRETS_FILE" ]; then
     echo "[ERROR] Secrets file not found: $SECRETS_FILE" >&2
